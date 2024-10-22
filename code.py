@@ -1,89 +1,152 @@
+from fastapi import FastAPI, HTTPException, Header, Depends, File, UploadFile
+from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
 import numpy as np
+import requests
 import json
-import faiss
-from openai import OpenAI
 import os
+import faiss
+import tiktoken  # Importer tiktoken pour compter les tokens
 
-# Assurez-vous de remplacer ceci par votre véritable clé API OpenAI
-api_key = ""
-client = OpenAI(api_key=api_key)
+app = FastAPI()
 
-# Charger les embeddings et les chunks
-embeddings = np.load('embedding.npy')
-with open('chunk.json', 'r') as f:
-    chunks = json.load(f)
+# Configuration du middleware CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Mettez ici les origines que vous autorisez
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Créer l'index FAISS
-dimension = embeddings.shape[1]
-index = faiss.IndexFlatIP(dimension)  # Index pour la similarité cosinus
-index.add(embeddings)
+# Récupérer la clé API depuis les variables d'environnement
+API_KEY = "sk-proj"
+if not API_KEY:
+    raise ValueError("La clé API OpenAI n'est pas définie dans les variables d'environnement.")
 
-def get_embedding(text):
+MODEL = "gpt-4o-mini"
+
+# Token d'accès (à configurer selon vos besoins)
+ACCESS_TOKEN = "m-lai-CaNYFR1GolGVp7uY8sQ51cSU35X3kB7lGx"
+
+# Vérification du token d'accès
+def verify_token(authorization: str = Header(...)):
+    if authorization != f"Bearer {ACCESS_TOKEN}":
+        raise HTTPException(status_code=401, detail="Token d'accès invalide.")
+
+# Fonction pour générer un embedding avec OpenAI
+def generate_openai_embedding(text, model):
+    url = "https://api.openai.com/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "input": text,
+        "model": model
+    }
+    response = requests.post(url, headers=headers, json=data)
+    response.raise_for_status()  # Vérifier les erreurs HTTP
+    return response.json()["data"][0]["embedding"]
+
+# Initialiser l'encodeur de tokens pour OpenAI
+tokenizer = tiktoken.get_encoding("cl100k_base")  # Utiliser l'encodeur correspondant au modèle GPT
+
+# Fonction pour calculer le nombre de tokens dans un chunk
+def count_tokens(chunk):
+    return len(tokenizer.encode(chunk))
+
+# Global dictionary to store indices and chunks per company_id
+company_indices = {}
+
+# Fonction pour rechercher les chunks similaires en respectant la limite de 8000 tokens
+def search_similar_chunks(query_embedding, company_id, token_limit=8000):
+    global company_indices
+
     try:
-        response = client.embeddings.create(
-            input=text,
-            model="text-embedding-3-large"
-        )
-        return np.array(response.data[0].embedding, dtype=np.float32)
+        # Vérifier si l'index pour le company_id existe déjà
+        if company_id not in company_indices:
+            # Charger les embeddings et les chunks
+            embeddings = np.load(f"./files/{company_id}/embeddings.npy").astype('float32')
+            with open(f"./files/{company_id}/chunks.json", "r") as f:
+                chunks = json.load(f)
+
+            # Normaliser les embeddings pour la similarité cosinus
+            faiss.normalize_L2(embeddings)
+
+            # Construire l'index FAISS
+            index = faiss.IndexFlatIP(embeddings.shape[1])  # Utiliser le produit scalaire pour la similarité cosinus
+            index.add(embeddings)
+
+            # Stocker l'index et les chunks
+            company_indices[company_id] = {'index': index, 'chunks': chunks}
+        else:
+            index = company_indices[company_id]['index']
+            chunks = company_indices[company_id]['chunks']
+
+        # Normaliser l'embedding de la requête
+        query_embedding = np.array(query_embedding).astype('float32')
+        faiss.normalize_L2(query_embedding.reshape(1, -1))
+
+        # Recherche initiale des résultats (récupérer tous les chunks)
+        top_k = len(chunks)
+        distances, indices_results = index.search(query_embedding.reshape(1, -1), top_k)
+
+        # Récupérer les chunks similaires
+        similar_chunks = [(distances[0][i], chunks[indices_results[0][i]]) for i in range(len(indices_results[0]))]
+
+        # Accumuler les chunks jusqu'à atteindre la limite de 8000 tokens
+        total_tokens = 0
+        selected_chunks = []
+        for _, chunk in similar_chunks:
+            chunk_tokens = count_tokens(chunk)
+            if total_tokens + chunk_tokens > token_limit:
+                break
+            selected_chunks.append(chunk)
+            total_tokens += chunk_tokens
+
+        return selected_chunks
+
     except Exception as e:
-        print(f"Erreur lors de l'obtention de l'embedding: {e}")
-        return None
+        raise HTTPException(status_code=500, detail=f"Search: {str(e)}")
 
-def create_context(question, max_len=8000, k=5):
-    q_embedding = get_embedding(question)
-    if q_embedding is None:
-        return ""
 
-    # Recherche des k plus proches voisins
-    distances, indices = index.search(q_embedding.reshape(1, -1), k)
+# Modèles Pydantic pour valider la requête et l'historique
+class Message(BaseModel):
+    role: str  # "user" ou "assistant"
+    content: str
 
-    returns = []
-    cur_len = 0
+class UserQuery(BaseModel):
+    company_id: str
+    question: str
+    embedding_model: str
 
-    for i in indices[0]:
-        cur_len += len(chunks[i]['text'].split()) + 4
-        if cur_len > max_len:
-            break
-        returns.append(chunks[i]["text"])
-
-    return "\n\n###\n\n".join(returns)
-
-def answer_question(question, max_len=8000, max_tokens=9000):
-    context = create_context(question, max_len=max_len)
-
+@app.post("/query")
+async def query_bot(user_query: UserQuery, authorization: str = Depends(verify_token)):
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for the company Ouellet, which Provide sustainable solutions to the HVAC (heating, ventilation, air conditioning) industry by offering systems designed to maximize residential comfort. This commitment is made possible by both the undertaking of our employees and the contribution of our partners in innovation. You help user find the best product from the large evantail of choice. If you dont have the answer, try to anmswer with common sense and dont said the context doesnt provide the indo. Never say that. An always give detail of your statement"},
-                {"role": "user", "content": f"Answer the question based on the context below, and if the question can't be answered based on the context, say \"I don't know\"\n\nContext: {context}\n\n---\n\nQuestion: {question}\nAnswer:"}
-            ],
-            max_tokens=max_tokens,
-            temperature=0,
-            top_p=1,
-            frequency_penalty=0,
-            presence_penalty=0
+        # Générer l'embedding pour la question de l'utilisateur
+        query_embedding = generate_openai_embedding(user_query.question, user_query.embedding_model)
+
+        # Rechercher les chunks similaires en respectant la limite de 8000 tokens
+        similar_chunks = search_similar_chunks(query_embedding, user_query.company_id, token_limit=8000)
+
+        return Response(
+            json.dumps(similar_chunks),
+            media_type="application/json"
         )
-        return response.choices[0].message.content.strip()
     except Exception as e:
-        print(f"Une exception s'est produite lors de la génération de la réponse: {e}")
-        return ""
-
-def chatbot(question):
-    print(f"\033[1mQuestion :\033[0m {question}")
-
-    print("\033[1mRéponse :\033[0m")
-    answer = answer_question(question=question)
-    print(answer)
-
-    return {'faiss': answer}
+        raise HTTPException(status_code=500, detail=f"Querybot: {str(e)}")
 
 
-# Define your queries
-queries = [
-"Donne info sur OWC-R"
-]
-
-# Loop through queries and get response from chatbot
-for query in queries:
-    response = chatbot(query)
+@app.post("/uploadfile/{company_id}")
+async def upload_file(file: UploadFile, company_id: str, authorization: str = Depends(verify_token)):
+    try:
+        file_path = f"./files/{company_id}/{file.filename}"
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "wb") as f:
+            f.write(file.file.read())
+            return {"message": "File saved successfully"}
+    except Exception as e:
+        return {"message": e.args}
